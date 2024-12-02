@@ -1,0 +1,8 @@
+torch
+torchaudio
+pyannote.audio
+scikit-learn
+SQLAlchemy
+numpy
+appdirs
+contextlib
