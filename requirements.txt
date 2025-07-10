@@ -1,8 +1,4 @@
-torch
-torchaudio
-pyannote.audio
+torch==2.4.1
+torchaudio==2.4.1
 scikit-learn
-SQLAlchemy
-numpy
-appdirs
-contextlib
+numpy==1.26.4
