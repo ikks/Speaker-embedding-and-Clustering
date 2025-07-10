@@ -1,3 +1,5 @@
+import concurrent.futures
+import urllib.request
 from pathlib import Path
 import os
 import torch
@@ -70,7 +72,7 @@ def load_embeddings(save_path):
     data = np.load(save_path, allow_pickle=True)
     all_embeddings = data['embeddings']
     speaker_info = data['speaker_info']
-    print(f"Loaded embeddings and speaker info from {save_path}")
+
     return all_embeddings, speaker_info
 
 
@@ -126,6 +128,10 @@ def assign_global_speaker_ids(labels, speaker_info):
         speaker_mapping[key] = cluster_label
     return speaker_mapping
 
+def generate_embedding(audio_file):
+    save_path = os.path.join(EMBEDDING_DIR, f"embedding_{audio_file.name}.npz")
+    return extract_speaker_embeddings([audio_file], save_path=save_path)
+
 def process_speaker_id(path_dir):
     audios = list(Path(path_dir).glob("*.wav"))
 
@@ -136,20 +142,37 @@ def process_speaker_id(path_dir):
     all_embeddings = []
     all_speaker_info = []
     print("Calculating embeddings...")
-    # Process each video from the database
-    for audio_file in audios:
 
+    new_embeddings = []
+
+    # Review if the embeddings have already been calculated
+    print("Loading previously calculated embeddings...")
+    for audio_file in audios:
         # Save embeddings in the 'embeddings' folder with the audio file name
         save_path = os.path.join(EMBEDDING_DIR, f"embedding_{audio_file.name}.npz")
 
         # If the embeddings file already exists, load it. Otherwise, extract and save embeddings
         if os.path.exists(save_path):
             embeddings, speaker_info = load_embeddings(save_path)
+            all_embeddings.extend(embeddings)
+            all_speaker_info.extend(speaker_info)
         else:
-            embeddings, speaker_info = extract_speaker_embeddings([audio_file], save_path=save_path)
+            new_embeddings.append(audio_file)
 
-        all_embeddings.extend(embeddings)
-        all_speaker_info.extend(speaker_info)
+    print("Embeddings to be calculated: {}".format(len(new_embeddings)))
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_embedding = {executor.submit(generate_embedding, audio_file): audio_file for audio_file in new_embeddings}
+        for future in concurrent.futures.as_completed(future_embedding):
+            # Save embeddings in the 'embeddings' folder with the audio file name
+            audio_file = future_embedding[future]
+            try:
+                embeddings, speaker_info = future.result()
+            except Exception as e:
+                print(f"Error in generating embeddings for {audio_file}: {e}")
+                raise e
+            else:
+                all_embeddings.extend(embeddings)
+                all_speaker_info.extend(speaker_info)
 
         #Free GPU memory after processing each file
 
@@ -159,7 +182,7 @@ def process_speaker_id(path_dir):
 
     # now that we have all embeddings, perform clustering and assign speaker IDs
     if all_embeddings:
-        cosine_sim_matrix = compute_similarity_matrix(all_embeddings)
+        # cosine_sim_matrix = compute_similarity_matrix(all_embeddings)
         labels = cluster_speaker(all_embeddings)
         speaker_mapping = assign_global_speaker_ids(labels, all_speaker_info)
 
@@ -175,7 +198,7 @@ def process_speaker_id(path_dir):
                 if audio_file not in file_speakers:
                     file_speakers[audio_file] = set()
                 file_speakers[audio_file].add(global_speaker_id)
-    print(file_speakers)
+    # print(file_speakers)
 
     print("Processing completed")
 
