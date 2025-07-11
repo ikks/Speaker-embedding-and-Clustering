@@ -237,14 +237,40 @@ def prepare_db(db_file, clean=False):
     return db
 
 
-def load_metadata(csv_filename, delimiter=","):
+def load_metadata(csv_filename, delimiter="|"):
+    # Has two columns delimited by |
+    # filename|transcription
     df = pd.read_csv(
         csv_filename, header=None, delimiter=delimiter, names=["fn", "transcription"]
     )
     return df
 
 
-def cluster_task(db_file, csv_file, path_wavs, delimiter=","):
+def load_sp_metadata(csv_filename, delimiter=","):
+    # Has three columns
+    # filename with prefix audio/,filesize,transcription
+    df = pd.read_csv(
+        csv_filename,
+        header=None,
+        delimiter=delimiter,
+        usecols=[0, 2],
+        names=["fn", "transcription"],
+    )
+    df["fn"] = df["fn"].str.replace("audio/", "")
+    return df
+
+
+def nb_cluster_task(db_file, csv_file, path_wavs, delimiter=","):
+    df = load_sp_metadata(csv_file, delimiter)
+    cluster_task(db_file, df, path_wavs)
+
+
+def local_cluster_task(db_file, csv_file, path_wavs, delimiter=","):
+    df = load_metadata(csv_file, delimiter)
+    cluster_task(db_file, df, path_wavs)
+
+
+def cluster_task(db_file, df, path_wavs):
     db = prepare_db(db_file)
     warnings.filterwarnings("ignore")
 
@@ -259,7 +285,6 @@ def cluster_task(db_file, csv_file, path_wavs, delimiter=","):
     except Exception as e:
         print(f"error initializing embedding model: {e}")
 
-    df = load_metadata(csv_file, delimiter)
     process_speaker_id(embedding_model, df, db, path_wavs)
     print("done")
 
@@ -268,7 +293,7 @@ def main():
     db_file = "db.sqlite"
     csv_file = "/tmp/metadata.csv"
     path_wavs = "/tmp/wavs/"
-    cluster_task(db_file, csv_file, path_wavs, "|")
+    local_cluster_task(db_file, csv_file, path_wavs, "|")
 
 
 if __name__ == "__main__":
