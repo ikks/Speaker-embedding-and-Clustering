@@ -1,5 +1,9 @@
+types-tqdm
+pandas
 torch==2.4.1
 torchaudio==2.4.1
 scikit-learn
 numpy==1.26.4
 sqlite-vec
+
+git+https://github.com/wenet-e2e/wespeaker.git

@@ -1,3 +1,4 @@
+from tqdm import tqdm
 import sqlite3
 import sqlite_vec
 from typing import List
@@ -6,6 +7,7 @@ import concurrent.futures
 from pathlib import Path
 import torch
 import numpy as np
+import pandas as pd
 import wespeaker
 from sklearn.cluster import HDBSCAN
 from sklearn.metrics.pairwise import cosine_distances
@@ -100,7 +102,7 @@ def serialize_f32(vector: List[float]) -> bytes:
     return struct.pack("%sf" % len(vector), *vector)
 
 
-def process_speaker_id(embedding_model, db, path_dir):
+def process_speaker_id(embedding_model, df, db, path_dir):
     audios = list(Path(path_dir).glob("*.wav"))
 
     if not audios:
@@ -144,14 +146,20 @@ def process_speaker_id(embedding_model, db, path_dir):
             executor.submit(generate_embedding, embedding_model, audio_file): audio_file
             for audio_file in new_embeddings
         }
-        for future in concurrent.futures.as_completed(future_embedding):
+        for future in tqdm(concurrent.futures.as_completed(future_embedding)):
             # Save embeddings in the 'embeddings' folder with the audio file name
             audio_file = future_embedding[future]
             try:
                 embedding, speaker_info = future.result()
+
+                userinfo = f"""{{"transcription": "{df[df["fn"] == audio_file.name].iloc[0]["transcription"]}"}}"""
                 db.execute(
-                    """INSERT INTO files(filename, filesize) VALUES(?, ?)""",
-                    [audio_file.name, audio_file.stat().st_size],
+                    """INSERT INTO files(filename, filesize, userinfo) VALUES(?, ?, ?)""",
+                    [
+                        audio_file.name,
+                        audio_file.stat().st_size,
+                        userinfo,
+                    ],
                 )
                 db.execute(
                     """INSERT INTO embeddings(rowid, embedding) 
@@ -229,8 +237,16 @@ def prepare_db(db_file, clean=False):
     return db
 
 
+def load_metadata(csv_filename):
+    df = pd.read_csv(
+        csv_filename, header=None, delimiter="|", names=["fn", "transcription"]
+    )
+    return df
+
+
 def main():
     db_file = "db.sqlite"
+    csv_file = "/tmp/metadata.csv"
     path_wavs = "/tmp/wavs/"
     db = prepare_db(db_file)
     warnings.filterwarnings("ignore")
@@ -246,7 +262,8 @@ def main():
     except Exception as e:
         print(f"error initializing embedding model: {e}")
 
-    process_speaker_id(embedding_model, db, path_wavs)
+    df = load_metadata(csv_file)
+    process_speaker_id(embedding_model, df, db, path_wavs)
     print("done")
 
 
