@@ -1,9 +1,9 @@
 from tqdm import tqdm
+from tqdm.notebook import tqdm as tqdm_nb
 import sqlite3
 import sqlite_vec
 from typing import List
 import struct
-import concurrent.futures
 from pathlib import Path
 import torch
 import numpy as np
@@ -141,43 +141,41 @@ def process_speaker_id(embedding_model, df, db, path_dir):
             new_embeddings.append(audio_file)
 
     print("Embeddings to be calculated: {}".format(len(new_embeddings)))
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_embedding = {
-            executor.submit(generate_embedding, embedding_model, audio_file): audio_file
-            for audio_file in new_embeddings
-        }
-        for future in tqdm(concurrent.futures.as_completed(future_embedding)):
-            # Save embeddings in the 'embeddings' folder with the audio file name
-            audio_file = future_embedding[future]
-            try:
-                embedding, speaker_info = future.result()
+    if is_notebook():
+        progress_bar = tqdm_nb
+    else:
+        progress_bar = tqdm
+    for audio_file in progress_bar(new_embeddings):
+        # Save embeddings in the 'embeddings' folder with the audio file name
+        try:
+            embedding, speaker_info = generate_embedding(embedding_model, audio_file)
 
-                userinfo = f"""{{"transcription": "{df[df["fn"] == audio_file.name].iloc[0]["transcription"]}"}}"""
-                db.execute(
-                    """INSERT INTO files(filename, filesize, userinfo) VALUES(?, ?, ?)""",
-                    [
-                        audio_file.name,
-                        audio_file.stat().st_size,
-                        userinfo,
-                    ],
-                )
-                db.execute(
-                    """INSERT INTO embeddings(rowid, embedding) 
-                       SELECT rowid,? FROM files WHERE filename = ?
-                    """,
-                    [serialize_f32(embedding), audio_file.name],
-                )
-                db.commit()
-            except Exception as e:
-                print(f"Error in generating embeddings for {audio_file}: {e}")
-                raise e
-            else:
-                all_embeddings.append(embedding)
-                all_speaker_info.append(speaker_info)
+            userinfo = f"""{{"transcription": "{df[df["fn"] == audio_file.name].iloc[0]["transcription"]}"}}"""
+            db.execute(
+                """INSERT INTO files(filename, filesize, userinfo) VALUES(?, ?, ?)""",
+                [
+                    audio_file.name,
+                    audio_file.stat().st_size,
+                    userinfo,
+                ],
+            )
+            db.execute(
+                """INSERT INTO embeddings(rowid, embedding)
+                   SELECT rowid,? FROM files WHERE filename = ?
+                """,
+                [serialize_f32(embedding), audio_file.name],
+            )
+            db.commit()
+        except Exception as e:
+            print(f"Error in generating embeddings for {audio_file}: {e}")
+            raise e
+        else:
+            all_embeddings.append(embedding)
+            all_speaker_info.append(speaker_info)
 
-            # Free GPU memory after processing each file
+        # Free GPU memory after processing each file
 
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
     print("Calculating cluster")
 
@@ -251,12 +249,12 @@ def load_sp_metadata(csv_filename, delimiter=","):
     # filename with prefix audio/,filesize,transcription
     df = pd.read_csv(
         csv_filename,
-        header=None,
+        header=1,
         delimiter=delimiter,
         usecols=[0, 2],
         names=["fn", "transcription"],
     )
-    df["fn"] = df["fn"].str.replace("audio/", "")
+    df["fn"] = df["fn"].str.replace("audios/", "")
     return df
 
 
@@ -287,6 +285,19 @@ def cluster_task(db_file, df, path_wavs):
 
     process_speaker_id(embedding_model, df, db, path_wavs)
     print("done")
+
+
+def is_notebook() -> bool:
+    try:
+        shell = get_ipython().__class__.__name__
+        if shell == "ZMQInteractiveShell":
+            return True  # Jupyter notebook or qtconsole
+        elif shell == "TerminalInteractiveShell":
+            return False  # Terminal running IPython
+        else:
+            return False  # Other type (?)
+    except NameError:
+        return False
 
 
 def main():
