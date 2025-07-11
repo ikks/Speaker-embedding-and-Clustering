@@ -4,7 +4,6 @@ from typing import List
 import struct
 import concurrent.futures
 from pathlib import Path
-import os
 import torch
 import numpy as np
 import wespeaker
@@ -13,25 +12,6 @@ from sklearn.metrics.pairwise import cosine_distances
 import warnings
 from contextlib import contextmanager
 
-warnings.filterwarnings("ignore")
-
-# GPU setup
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"using device: {device}")
-
-try:
-    print("Initializing embedding model...")
-    embedding_model = model = wespeaker.load_model("english")
-    print("Embedding model initialized")
-except Exception as e:
-    print(f"error initializing embedding model: {e}")
-
-# Create a folder for saving embeddings if it doesn't exist
-EMBEDDING_DIR = "embeddings"
-if not os.path.exists(EMBEDDING_DIR):
-    os.makedirs(EMBEDDING_DIR)
-    print(f"Created directory for embeddings: {EMBEDDING_DIR}")
-
 
 @contextmanager
 def no_grad_context():
@@ -39,47 +19,22 @@ def no_grad_context():
         yield
 
 
-def extract_speaker_embeddings(audio_files, save_path):
-    all_embeddings = []
-    speaker_info = []
+def extract_speaker_embedding(embedding_model, audio_file):
+    # Extract embedding
+    embedding = embedding_model.extract_embedding(audio_file)
+    if not isinstance(embedding, np.ndarray):
+        embedding = embedding.numpy()
 
-    for audio_file in audio_files:
-        print(f"\nProcessing file: {audio_file.name}")
+    embedding = embedding / np.linalg.norm(embedding)
+    speaker_info = {
+        "audio_file": audio_file.name,
+        "embedding": embedding,
+    }
 
-        # Extract embedding
-        embedding = embedding_model.extract_embedding(audio_file)
-        if not isinstance(embedding, np.ndarray):
-            embedding = embedding.numpy()
+    # Free GPU memory after each embedding extraction
+    torch.cuda.empty_cache()
 
-        embedding = embedding / np.linalg.norm(embedding)
-        all_embeddings.append(embedding)
-        speaker_info.append(
-            {
-                "audio_file": audio_file.name,
-                "local_speaker_label": audio_file.name,
-                "embedding": embedding,
-            }
-        )
-        try:
-            np.savez_compressed(
-                save_path, embeddings=all_embeddings, speaker_info=speaker_info
-            )
-            print(f"Saved embeddings and speaker info to {save_path}")
-        except Exception as e:
-            print(f"Error embedding { e }")
-
-        # Free GPU memory after each embedding extraction
-        torch.cuda.empty_cache()
-
-    return all_embeddings, speaker_info
-
-
-def load_embeddings(save_path):
-    data = np.load(save_path, allow_pickle=True)
-    all_embeddings = data["embeddings"]
-    speaker_info = data["speaker_info"]
-
-    return all_embeddings, speaker_info
+    return embedding, speaker_info
 
 
 def compute_similarity_matrix(embeddings, batch_size=1000):
@@ -121,7 +76,7 @@ def cluster_speaker(embeddings):
     labels = clustering.labels_
 
     print(
-        f"Clustering completed. Number of clusters found: {len(set(labels)) - (1 if -1 in labels else 0)}"
+        f"Clustering completed. Number of speakers found: {len(set(labels)) - (1 if -1 in labels else 0)}"
     )
     return labels
 
@@ -129,17 +84,15 @@ def cluster_speaker(embeddings):
 def assign_global_speaker_ids(labels, speaker_info):
     speaker_mapping = {}
     for idx, info in enumerate(speaker_info):
-        key = (info["audio_file"], info["local_speaker_label"])
         cluster_label = labels[idx]
         if cluster_label == -1:
             continue
-        speaker_mapping[key] = cluster_label
+        speaker_mapping[info["audio_file"]] = cluster_label
     return speaker_mapping
 
 
-def generate_embedding(audio_file):
-    save_path = os.path.join(EMBEDDING_DIR, f"embedding_{audio_file.name}.npz")
-    return extract_speaker_embeddings([audio_file], save_path=save_path)
+def generate_embedding(embedding_model, audio_file):
+    return extract_speaker_embedding(embedding_model, audio_file)
 
 
 def serialize_f32(vector: List[float]) -> bytes:
@@ -147,55 +100,55 @@ def serialize_f32(vector: List[float]) -> bytes:
     return struct.pack("%sf" % len(vector), *vector)
 
 
-def process_speaker_id(db, path_dir):
+def process_speaker_id(embedding_model, db, path_dir):
     audios = list(Path(path_dir).glob("*.wav"))
 
     if not audios:
         print("No valid audio files found for processing")
         return
 
+    n_audios = len(audios)
     all_embeddings = []
     all_speaker_info = []
     new_embeddings = []
 
+    processed = 0
+    print(f"Reviewing {n_audios} files")
     # Review if the embeddings have already been calculated
     print("Loading previously calculated embeddings...")
 
     for audio_file in audios:
-        # Save embeddings in the 'embeddings' folder with the audio file name
-        save_path = os.path.join(EMBEDDING_DIR, f"embedding_{audio_file.name}.npz")
-        # If the embedding is already calculated, load it.
         rows = db.execute(
             """
-            SELECT e.embedding FROM files f, embeddings e WHERE f.filename = ?
+            SELECT e.embedding FROM files f, embeddings e
+            WHERE e.rowid = f.rowid AND f.filename = ?
             """,
             [audio_file.name],
         ).fetchall()
-        if os.path.exists(save_path):
-            embeddings, speaker_info = load_embeddings(save_path)
-            if len(rows) > 0:
-                embeddings2 = np.array(
-                    [struct.unpack("256f", rows[0][0])], dtype=np.float32
-                )
-                for i in range(len(embeddings[0])):
-                    assert embeddings[0][i] == embeddings2[0][i]
-                embeddings = embeddings2
-            all_embeddings.extend(embeddings)
-            all_speaker_info.extend(speaker_info)
+        # If the embedding is already calculated, load it.
+        if len(rows) > 0:
+            embeddings = np.array([struct.unpack("256f", rows[0][0])], dtype=np.float32)
+            speaker_info = {
+                "audio_file": audio_file.name,
+                "embedding": embeddings,
+            }
+            all_embeddings.append(embeddings[0])
+            all_speaker_info.append(speaker_info)
+            processed += 1
         else:
             new_embeddings.append(audio_file)
 
     print("Embeddings to be calculated: {}".format(len(new_embeddings)))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+    with concurrent.futures.ThreadPoolExecutor() as executor:
         future_embedding = {
-            executor.submit(generate_embedding, audio_file): audio_file
+            executor.submit(generate_embedding, embedding_model, audio_file): audio_file
             for audio_file in new_embeddings
         }
         for future in concurrent.futures.as_completed(future_embedding):
             # Save embeddings in the 'embeddings' folder with the audio file name
             audio_file = future_embedding[future]
             try:
-                embeddings, speaker_info = future.result()
+                embedding, speaker_info = future.result()
                 db.execute(
                     """INSERT INTO files(filename, filesize) VALUES(?, ?)""",
                     [audio_file.name, audio_file.stat().st_size],
@@ -204,19 +157,19 @@ def process_speaker_id(db, path_dir):
                     """INSERT INTO embeddings(rowid, embedding) 
                        SELECT rowid,? FROM files WHERE filename = ?
                     """,
-                    [serialize_f32(embeddings[0]), audio_file.name],
+                    [serialize_f32(embedding), audio_file.name],
                 )
                 db.commit()
             except Exception as e:
                 print(f"Error in generating embeddings for {audio_file}: {e}")
                 raise e
             else:
-                all_embeddings.extend(embeddings)
-                all_speaker_info.extend(speaker_info)
+                all_embeddings.append(embedding)
+                all_speaker_info.append(speaker_info)
 
-        # Free GPU memory after processing each file
+            # Free GPU memory after processing each file
 
-        torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
     print("Calculating cluster")
 
@@ -230,18 +183,14 @@ def process_speaker_id(db, path_dir):
         update_db_cluster_info(db, speaker_mapping)
         for info in all_speaker_info:
             # Check if 'info' is structured correctly as a dictionary
-            if "audio_file" in info and "local_speaker_label" in info:
+            if "audio_file" in info:
                 audio_file = info["audio_file"]
-                key = (audio_file, info["local_speaker_label"])
-                global_speaker_id = speaker_mapping.get(key, -1)
+                global_speaker_id = speaker_mapping.get(audio_file, -1)
                 if global_speaker_id == -1:
                     continue
                 if audio_file not in file_speakers:
                     file_speakers[audio_file] = set()
                 file_speakers[audio_file].add(global_speaker_id)
-    # print(file_speakers)
-
-    print("Processing completed")
 
 
 def update_db_cluster_info(db, speaker_mapping):
@@ -251,7 +200,7 @@ def update_db_cluster_info(db, speaker_mapping):
           UPDATE files SET label = ?
           WHERE filename = ?  
         """,
-            [str(val), key[0]],
+            [str(val), key],
         )
         if res.rowcount > 0:
             db.commit()
@@ -263,8 +212,8 @@ def prepare_db(db_file, clean=False):
     sqlite_vec.load(db)
     db.enable_load_extension(False)
     if clean:
-        db.execute("DELETE FROM embeddings")
-        db.execute("DELETE FROM files")
+        db.execute("DROP TABLE embeddings")
+        db.execute("DROP TABLE files")
     db.execute("""
         CREATE TABLE IF NOT EXISTS files(
             filename VARCHAR(2048),
@@ -280,9 +229,26 @@ def prepare_db(db_file, clean=False):
     return db
 
 
-if __name__ == "__main__":
+def main():
     db_file = "db.sqlite"
     path_wavs = "/tmp/wavs/"
     db = prepare_db(db_file)
-    process_speaker_id(db, path_wavs)
+    warnings.filterwarnings("ignore")
+
+    # GPU setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"using device: {device}")
+
+    try:
+        print("Initializing embedding model...")
+        embedding_model = wespeaker.load_model("english")
+        print("Embedding model initialized")
+    except Exception as e:
+        print(f"error initializing embedding model: {e}")
+
+    process_speaker_id(embedding_model, db, path_wavs)
     print("done")
+
+
+if __name__ == "__main__":
+    main()
