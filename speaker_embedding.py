@@ -237,17 +237,14 @@ def prepare_db(db_file, clean=False):
     return db
 
 
-def load_metadata(csv_filename):
+def load_metadata(csv_filename, delimiter=","):
     df = pd.read_csv(
-        csv_filename, header=None, delimiter="|", names=["fn", "transcription"]
+        csv_filename, header=None, delimiter=delimiter, names=["fn", "transcription"]
     )
     return df
 
 
-def main():
-    db_file = "db.sqlite"
-    csv_file = "/tmp/metadata.csv"
-    path_wavs = "/tmp/wavs/"
+def cluster_task(db_file, csv_file, path_wavs, delimiter=","):
     db = prepare_db(db_file)
     warnings.filterwarnings("ignore")
 
@@ -262,9 +259,16 @@ def main():
     except Exception as e:
         print(f"error initializing embedding model: {e}")
 
-    df = load_metadata(csv_file)
+    df = load_metadata(csv_file, delimiter)
     process_speaker_id(embedding_model, df, db, path_wavs)
     print("done")
+
+
+def main():
+    db_file = "db.sqlite"
+    csv_file = "/tmp/metadata.csv"
+    path_wavs = "/tmp/wavs/"
+    cluster_task(db_file, csv_file, path_wavs, "|")
 
 
 if __name__ == "__main__":
